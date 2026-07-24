@@ -15,12 +15,21 @@ def get_go_terms_for_gene(gene_names: list[str], taxon_id: int, category_map: di
     """
     # Combine all gene names into a single OR query
     gene_names_lower = {g.lower(): g for g in gene_names}  # lowercase → original
-    gene_query = " OR ".join(f"{g}" for g in gene_names)
+    gene_queries = {f"gene:{g}" for g in gene_names_lower.values()}  # add gene_exact key to all entries
+    gene_clause = f"({' OR '.join(gene_queries)})"
+
+    # Build query componentes dynamically
+    query_parts = [gene_clause]
+    query_parts.append(f"organism_id:{taxon_id}")
+    #query_parts.append(f"reviewed:true")
+
+    # Combine parts with AND
+    full_query = " AND ".join(query_parts)
 
     uniprot_search_url = "https://rest.uniprot.org/uniprotkb/search"
 
     params = {
-        "query": f"gene_exact:{gene_query} AND organism_id:{taxon_id} AND reviewed:true",
+        "query": full_query,
         "fields": "gene_names,go_id,go",   # request GO IDs + full GO annotation field
         "format": "json",
         "size": len(gene_names) * 3,  # allow headroom for multiple hits per gene
@@ -32,7 +41,7 @@ def get_go_terms_for_gene(gene_names: list[str], taxon_id: int, category_map: di
     results = response.json().get("results", [])
 
     if not results:
-        print(f"  [!] No UniProt entry found for genes: {gene_query}")
+        print(f"  [!] No UniProt entry found for query: {full_query}")
         return []
     
     seen_genes = set()

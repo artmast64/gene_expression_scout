@@ -3,6 +3,7 @@
 import os
 import io
 import time
+import json
 import re
 import gzip
 import zipfile
@@ -12,6 +13,10 @@ import math
 import requests
 import pandas as pd
 import GEOparse
+
+# Runtime global cache to prevent repeating the eutils/Datasets API pipeline for the same RefSeq/assembly ID
+# processed_refseq_acc_set = set()
+global_gff_mapping_cache: dict[str, dict[str, str]] = {}
 
 
 def best_assembly_report(reports: list[dict]) -> dict | None:
@@ -55,7 +60,10 @@ def nc_accession_to_assembly_accession(nc_accession: str, ncbi_email: str) -> st
     try:
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        
+        # Sanitize dangerous control characters from raw text before parsing JSON
+        clean_text = re.sub(r'[\x00-\x1F\x7F]', '', resp.text)
+        data = json.loads(clean_text) # Ensure you 'import json' at the top of the file
     except Exception as e:
         print(f"[GFF] eutils nuccore-assembly link failed: {e}")
         return None
@@ -188,7 +196,6 @@ def extract_gff_hints_from_gsm(gsm) -> tuple[str | None, str | None]:
         match = refseq_accession_re.search(entry)
         if match:
             refseq_accession = match.group(1)
-            print(f"[GFF] RefSeq accession from data_processing: '{refseq_accession}'")
             break   # accession found — no need to check further entries
  
     # 2. source_name: treat the whole value as a potential strain name
@@ -197,7 +204,6 @@ def extract_gff_hints_from_gsm(gsm) -> tuple[str | None, str | None]:
             m = strain_name_re.search(entry)
             if m:
                 strain_name = m.group(0)
-                print(f"[GFF] Strain from source_name: '{strain_name}'")
                 break
  
     # 3. characteristics_ch1: look for an explicit 'strain:' key
@@ -205,7 +211,6 @@ def extract_gff_hints_from_gsm(gsm) -> tuple[str | None, str | None]:
         for char in gsm.metadata.get("characteristics_ch1", []):
             if char.lower().startswith("strain:"):
                 strain_name = char.split(":", 1)[1].strip()
-                print(f"[GFF] Strain from characteristics_ch1: '{strain_name}'")
                 break
  
     return refseq_accession, strain_name
@@ -214,29 +219,24 @@ def extract_gff_hints_from_gsm(gsm) -> tuple[str | None, str | None]:
 def download_gff(assembly_accession: str, gff_cache_dir: str) -> str:
     """
     Downloads a GFF file from NCBI (if not already cached) and returns
-    the local file path. Files are cached in GFF_CACHE_DIR by assembly
-    accession so each assembly is only downloaded once per session.
+    the local file path. Checks gff_cache_dir first to prevent redownloads.
     """
     os.makedirs(gff_cache_dir, exist_ok=True)
     cache_path = os.path.join(gff_cache_dir, f"{assembly_accession}_gff.zip")
 
     if os.path.exists(cache_path):
-        print(f"[GFF] Using cached file: {cache_path}")
+        print(f"[GFF CACHE HIT] Using locally cached archive file: {cache_path}")
         return cache_path
     
     gff_url = f"https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/{assembly_accession}/download"
     params = {
-        "include_annotation_type": ["GENOME_FASTA",
-        "GENOME_GFF",
-        "RNA_FASTA",
-        "CDS_FASTA",
-        "PROT_FASTA",
-        "SEQUENCE_REPORT"
+        "include_annotation_type": [
+            "GENOME_FASTA", "GENOME_GFF", "RNA_FASTA", "CDS_FASTA", "PROT_FASTA", "SEQUENCE_REPORT"
         ],
         "hydrated": "FULLY_HYDRATED",
     }
 
-    print(f"[GFF] Downloading GFF from NCBI: {gff_url}")
+    print(f"[GFF DOWNLOAD] Cached file not found in '{gff_cache_dir}'. Fetching from NCBI: {gff_url}")
     response = requests.get(gff_url, params=params, timeout=120)
     response.raise_for_status()
 
@@ -244,48 +244,77 @@ def download_gff(assembly_accession: str, gff_cache_dir: str) -> str:
         for chunk in response.iter_content(chunk_size=1024 * 64):
             f.write(chunk)
 
-    print(f"[GFF] Saved to: {cache_path}")
+    print(f"[GFF] Saved new file to cache: {cache_path}")
     return cache_path
 
 
 def get_id_to_symbol_map_for_gse(gse, species: str, gff_cache_dir: str, ncbi_email: str) -> dict[str, str]:
     """
-    High-level helper: resolves the correct strain-specific GFF for this
-    experiment and returns the id→symbol mapping dict.
- 
-    Resolution priority (stops at first success):
-      1. Sample the first GSM for a RefSeq/assembly accession in
-         data_processing — the most precise identifier, directly tied to
-         the genome the authors actually aligned to.
-      2. Use a strain name from source_name or characteristics_ch1 to
-         search NCBI Datasets — less precise but usually sufficient.
-      3. Return an empty dict, causing normalize_index_to_symbols to leave
-         the expression matrix index unchanged rather than mismapping genes.
+    Scans ALL GSMs in the series to identify every unique taxon/strain involved, 
+    resolving and merging their GFF mappings to support multi-taxon experiments.
+    Uses global in-memory cache if an assembly/RefSeq ID was already parsed.
     """
-    # Sample the first GSM for hints
-    first_gsm = next(iter(gse.gsms.values()), None)
-    #first_gsm = next(iter(gse["samples"]), None)
+    merged_id_to_symbol = {}
+    resolved_assemblies = set()
+    reported_current_gse = set()
 
-    refseq_accession, strain_name = (None, None)
-    if first_gsm:
-        refseq_accession, strain_name = extract_gff_hints_from_gsm(first_gsm)
- 
-    # Priority 1: resolve directly from the reference accession
-    assembly_accession = None
-    if refseq_accession:
-        assembly_accession = resolve_gff_acc_from_refseq_accession(refseq_accession, ncbi_email)
- 
-    # Priority 2: fall back to strain name search
-    if not assembly_accession and strain_name:
-        assembly_accession = resolve_gff_acc_from_strain_name(strain_name, species)
- 
-    if not assembly_accession:
-        print("[GFF] Could not resolve a GFF for this experiment — "
-              "locus tag normalisation will be skipped.")
-        return {}
+    print(f"[{gse.name}] Scanning samples for taxons/strains...")
+    for gsm_name, gsm in gse.gsms.items():
+        # Fallback to sample-specific organism metadata if available
+        gsm_species = gsm.metadata.get("organism_ch1", [species])[0]
 
-    gff_path = download_gff(assembly_accession, gff_cache_dir)
-    return build_id_to_symbol_map(gff_path)
+        # Safely pull hints first
+        refseq_accession, strain_name = extract_gff_hints_from_gsm(gsm)
+
+        # Determine a signature identifier to check for spam
+        # Priority on RefSeq identifier, fallback to specific strain text
+        identifier_signature = refseq_accession if refseq_accession else strain_name
+
+        if not identifier_signature:
+            continue
+
+        # Check local experiment cache for repetition within the exact same GSE series
+        if identifier_signature in reported_current_gse:
+            continue
+        reported_current_gse.add(identifier_signature)
+
+        # Check global cache across separate experiments
+        if identifier_signature in global_gff_mapping_cache:
+            print(f"[{gse.name}] Reusing cached GFF mapping for identifier '{identifier_signature}'.")
+            merged_id_to_symbol.update(global_gff_mapping_cache[identifier_signature])
+            continue
+
+        # Resolve assembly if brand new
+        assembly_accession = None
+        if refseq_accession:
+            assembly_accession = resolve_gff_acc_from_refseq_accession(refseq_accession, ncbi_email)
+        if not assembly_accession and strain_name:
+            assembly_accession = resolve_gff_acc_from_strain_name(strain_name, gsm_species)
+            
+        if assembly_accession:
+            # Check if assembly accession itself is in the global cache
+            if assembly_accession in global_gff_mapping_cache:
+                print(f"[{gse.name}] Reusing cached GFF mapping for assembly '{assembly_accession}'.")
+                taxon_map = global_gff_mapping_cache[assembly_accession]
+            else:
+                try:
+                    gff_path = download_gff(assembly_accession, gff_cache_dir)
+                    taxon_map = build_id_to_symbol_map(gff_path)
+                    # Store in global cache
+                    global_gff_mapping_cache[assembly_accession] = taxon_map
+                    print(f"[{gse.name}] Successfully merged GFF mappings for assembly: {assembly_accession} ({gsm_species})")
+                except Exception as e:
+                    print(f"[{gse.name}] Failed parsing GFF for assembly {assembly_accession}: {e}")
+                    continue
+
+            # Map signature to cached dictionary
+            global_gff_mapping_cache[identifier_signature] = taxon_map
+            merged_id_to_symbol.update(taxon_map)
+            resolved_assemblies.add(assembly_accession)
+
+    if not merged_id_to_symbol and not resolved_assemblies:
+        print(f"[{gse.name}] Note: No new unique strain GFF mappings were needed or resolved.")
+    return merged_id_to_symbol
 
 
 def build_id_to_symbol_map(gff_path: str) -> dict[str, str]:
@@ -393,7 +422,19 @@ def normalize_index_to_symbols(
     Returns a new DataFrame with a gene-symbol index.
     """    
     original_index = df.index.tolist()
-    mapped = [id_to_symbol.get(idx) or id_to_symbol.get(str(idx).lower()) for idx in original_index]
+    mapped = []
+    for idx in original_index:
+        idx_str = str(idx).strip()
+        
+        # Direct match
+        symbol = id_to_symbol.get(idx_str) or id_to_symbol.get(idx_str.lower())
+        
+        # Match without version dot suffix (e.g. "ECB_RS00005.1" -> "ECB_RS00005")
+        if not symbol and "." in idx_str:
+            no_dot = idx_str.split(".")[0]
+            symbol = id_to_symbol.get(no_dot) or id_to_symbol.get(no_dot.lower())
+            
+        mapped.append(symbol)
 
     mapped_count = sum(1 for m in mapped if m is not None)
     tag = f"[{geo_accession}] " if geo_accession else ""
@@ -539,141 +580,185 @@ def run_geo_expression_pipeline(
     return experiments
 
 
+def extract_nested_files(content_bytes: bytes, filename: str) -> list[tuple[str, bytes]]:
+    """
+    Recursively extracts files from compressed archives (.gz, .tar, .tar.gz, .zip).
+    Returns a list of tuples containing (individual_filename, uncompressed_bytes).
+    """
+    extracted_files = []
+    lower_name = filename.lower()
+
+    try:
+        if lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz"):
+            with tarfile.open(fileobj=io.BytesIO(content_bytes), mode="r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and not os.path.basename(member.name).startswith('.'):
+                        print(f"  [Archive Contents] Found file in TAR.GZ: {member.name}")
+                        f_bytes = tar.extractfile(member).read()
+                        extracted_files.extend(extract_nested_files(f_bytes, member.name))
+                        
+        elif lower_name.endswith(".tar"):
+            with tarfile.open(fileobj=io.BytesIO(content_bytes), mode="r:") as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and not os.path.basename(member.name).startswith('.'):
+                        print(f"  [Archive Contents] Found file in TAR: {member.name}")
+                        f_bytes = tar.extractfile(member).read()
+                        extracted_files.extend(extract_nested_files(f_bytes, member.name))
+                        
+        elif lower_name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(content_bytes)) as z:
+                for name in z.namelist():
+                    if not os.path.basename(name).startswith('.'):
+                        print(f"  [Archive Contents] Found file in ZIP: {name}")
+                        f_bytes = z.read(name)
+                        extracted_files.extend(extract_nested_files(f_bytes, name))
+                        
+        elif lower_name.endswith(".gz") and not lower_name.endswith(".tar.gz"):
+            # Decompress single file
+            decompressed = gzip.decompress(content_bytes)
+            # Strip the .gz extension to check the inner filename format
+            inner_name = filename[:-3]
+            print(f"  [Archive Contents] Decompressed single GZ wrapper for: {inner_name}")
+            extracted_files.extend(extract_nested_files(decompressed, inner_name))
+            
+        else:
+            # Base case: uncompressed or final file level
+            extracted_files.append((filename, content_bytes))
+            
+    except Exception as e:
+        print(f"  [Archive Extraction Warning] Failed to unpack archive tier for {filename}: {e}")
+        
+    return extracted_files
+
+
 def get_rnaseq_expression_for_genes(
     geo_accession: str,
     genes_of_interest: list[str],
     id_to_symbol: dict[str, str],
-) -> pd.DataFrame:
+    warn_file_size_mb: int = 512,
+    approved_files=None,
+    rejected_files=None,
+    series_title="",
+) -> tuple[pd.DataFrame, dict | None]:
     """
     For RNA-seq GSE accessions where GEOparse returns empty tables,
-    fetch the series matrix or supplemental count file from GEO FTP.
+    fetches and iterates through all valid supplemental files, unpacking nested 
+    compressions to aggregate gene expression metrics across all formats.
     """
-    gse = GEOparse.get_GEO(geo=geo_accession, destdir="./geo_cache/", silent=True)
+    if approved_files is None:
+        approved_files = set()
+    if rejected_files is None:
+        rejected_files = set()
 
-    # Step 1: find supplemental file URLs from the GSE metadata
+    # Find supplemental file URLs from the GSE metadata
+    gse = GEOparse.get_GEO(geo=geo_accession, destdir="./geo_cache/", silent=True)
     suppl_files = gse.metadata.get("supplementary_file", [])
     print(f"[{geo_accession}] Supplemental files:")
     for f in suppl_files:
         print(f"  {f}")
 
-    # Step 2: filter to likely count/expression matrix files
+    # Identify non-raw valid data files
     # RNA-seq studies typically provide a single counts or TPM matrix
-    #preferred_keywords = ["count", "tpm", "fpkm", "rpkm", "expression", "matrix"]
-    skip_keywords = [".cel", ".idat", ".bam", ".fastq"] # ["raw", ".cel", ".idat", ".bam", ".fastq"]
-
+    skip_keywords = [".cel", ".idat", ".bam", ".fastq", ".fasta"]
+    valid_extensions = (".gz", ".tar.gz", ".tar", ".tgz", ".zip", ".txt", ".csv", ".tsv", ".xls", ".xlsx")
+    
     candidates = [
         f for f in suppl_files
-        #if any(k in f.lower() for k in preferred_keywords)
-        #and not any(k in f.lower() for k in skip_keywords)
-        if not any(k in f.lower() for k in skip_keywords)
-        and f.endswith((".gz", ".tar.gz", ".tar", ".txt", ".csv", ".tsv", ".xls", ".xlsx"))
+        if not any(k in f.lower() for k in skip_keywords) and f.lower().endswith(valid_extensions)
     ]
 
     if not candidates:
-        print(f"[{geo_accession}] No suitable supplemental file found automatically.")
-        # print("Try passing a file URL directly via the suppl_url= parameter.")
-        return pd.DataFrame()
+        print(f"[{geo_accession}] No suitable expression supplemental files found.")
+        return pd.DataFrame(), None
+    
+    combined_suppl_df = pd.DataFrame()
 
-    # Use the first candidate (inspect the printed list to pick a better one if needed)
-    file_url = candidates[0]
-    download_url = file_url.replace("ftp://", "https://")
+    for file_url in candidates:
+        # Check if user rejected this file earlier
+        if file_url in rejected_files:
+            print(f"[{geo_accession}] Skipping rejected file: {file_url}")
+            continue
 
-    # Get file size using a HEAD request
-    try:
-        # headers=None or standard user-agent to ensure NCBI accepts the request
-        head_response = requests.head(download_url, timeout=30, allow_redirects=True)
-        head_response.raise_for_status()
-        
-        # Get content length in bytes (default to 0 if header is missing)
-        content_length = int(head_response.headers.get('Content-Length', 0))
-        file_size_mb = content_length / (1024 * 1024)
-        
-        if content_length > 0:
-            print(f"[{geo_accession}] File size: {file_size_mb:.2f} MB")
+        filename = os.path.basename(file_url)
+        download_url = file_url.replace("ftp://", "https://")
+
+        # Check file size before downloading the entire file
+        size_mb = get_remote_file_size_mb(file_url)
+
+        if size_mb and size_mb > warn_file_size_mb:
+            if file_url not in approved_files:
+                print(f"[{geo_accession}] Large file detected ({size_mb} MB). Requesting user approval...")
+                prompt_info = {
+                    "series": f"{geo_accession}: {series_title}",
+                    "filename": filename,
+                    "url": file_url,
+                    "size_mb": size_mb
+                }
+                # Pause and return prompt to caller
+                return pd.DataFrame(), prompt_info               
             
-            # Size threshold warning prompt
-            if file_size_mb > 100:
-                user_input = input(f"[WARNING]: This file is large ({file_size_mb:.2f} MB). Do you want to download it? (y/n): ")
-                if user_input.strip().lower() != 'y':
-                    print(f"[{geo_accession}] Download skipped.")
-                    return pd.DataFrame()
-        else:
-            print(f"[{geo_accession}] Could not determine file size automatically from server.")
+        print("  ↳")
+        print(f"[{geo_accession}] Processing supplemental root file entry: {file_url}")
+        print(f"[{geo_accession}] File size {file_url} ({size_mb} MB)")
 
-    except requests.exceptions.RequestException as e:
-        print(f"[{geo_accession}] Warning: Could not verify file size ({e}).")
-
-
-    print(f"[{geo_accession}] Downloading: {file_url}")
-    response = requests.get( download_url, timeout=60)
-    response.raise_for_status()
-
-    # Step 3: read into a DataFrame — try common separators
-    raw = io.BytesIO(response.content)
-
-    #print(f">>>>>>>>>> file_url: {file_url}")
-    if file_url.endswith(".xls.gz") or file_url.endswith(".xlsx.gz"):
-        with gzip.GzipFile(fileobj=raw) as f:
-            excel_bytes = io.BytesIO(f.read())
-        df = pd.read_excel(excel_bytes, index_col=0)
-    elif file_url.endswith(".tar.gz"):
-        with tarfile.open(fileobj=raw, mode="r:gz") as tar:
-            members = tar.getnames() # Get a list of all file names inside the tar archive
-            data_file_name = next((m for m in members if not m.startswith('.') and # Look for the data file you want to read (skipping hidden system files)
-                                (m.endswith('.xls') or m.endswith('.xlsx') or m.endswith('.tsv') or m.endswith('.csv'))), None)
+        try:
+            response = requests.get(download_url, timeout=90)
+            response.raise_for_status()
             
-            if data_file_name:
-                extracted_file = tar.extractfile(data_file_name)
+            # Unpack all potential nested data tables
+            all_files = extract_nested_files(response.content, filename)
+            
+            for fname, fbytes in all_files:
+                is_valid_format = fname.lower().endswith((".csv", ".tsv", ".txt", ".xls", ".xlsx"))
+
+                if not is_valid_format:
+                    print(f"  [-] IGNORED file (unsupported tabular extension): {fname}")
+                    continue
+
+                print(f"  [+] KEEPING & PARSING data table: {fname}")
+                df = detect_header_rows_and_parse_tabular(fbytes, fname)
+
+                if df.empty:
+                    print(f"  [-] SKIPPED data table (empty dataframe parsed): {fname}")
+                    continue
+
+                # Disambiguate generic column names (e.g. "Count") using file names
+                sample_label = os.path.splitext(fname)[0] # Extract filename without extension
                 
-                if data_file_name.endswith(('.xls', '.xlsx')):
-                    excel_bytes = io.BytesIO(extracted_file.read())
-                    df = pd.read_excel(excel_bytes, index_col=0)
-                    
-                else:
-                    sep = "\t" if data_file_name.endswith(".tsv") or data_file_name.endswith(".txt") else ","
-                    df = pd.read_csv(extracted_file, sep=sep, index_col=0)
-            else:
-                raise FileNotFoundError("No valid data file found inside the TAR archive.")
-    elif file_url.endswith(".gz"):
-        with gzip.GzipFile(fileobj=raw) as f:
-            sep = "\t" if file_url.endswith(".tsv.gz") else ","
-            df = pd.read_csv(f, sep=sep, index_col=0)
-    elif file_url.endswith(".tar"):
-        with tarfile.open(fileobj=raw, mode="r:") as tar: # Change mode to "r:" for uncompressed TAR files
-            members = tar.getnames() # Get a list of all file names inside the tar archive
-            data_file_name = next((m for m in members if not m.startswith('.') and # Look for the data file you want to read (skipping hidden system files)
-                                (m.endswith('.xls') or m.endswith('.xlsx') or m.endswith('.tsv') or m.endswith('.csv'))), None)
-            if data_file_name:
-                extracted_file = tar.extractfile(data_file_name)
+                # If there's only 1 column and it has a non-unique generic name, rename it to sample_label
+                generic_names = {"count", "counts", "readcount", "read_count", "val", "value", "expression", "fpkm", "tpm"}
+                renamed_cols = {}
+                for col in df.columns:
+                    if str(col).strip().lower() in generic_names:
+                        renamed_cols[col] = sample_label
+                if renamed_cols:
+                    df = df.rename(columns=renamed_cols)
                 
-                if data_file_name.endswith(('.xls', '.xlsx')):
-                    excel_bytes = io.BytesIO(extracted_file.read())
-                    df = pd.read_excel(excel_bytes, index_col=0)
+                # Normalize index to gene symbols
+                df = normalize_index_to_symbols(df, id_to_symbol, geo_accession)
+                
+                # Align rows with targets
+                found_genes = df.index.intersection(genes_of_interest)
+                df_filtered = df.loc[found_genes]
+                
+                if not df_filtered.empty:
+                    # Combine columns into our running collection
+                    # Force all values to float to guarantee no leftover string cells from .xls files
+                    df_filtered = df_filtered.apply(pd.to_numeric, errors='coerce')
+                    combined_suppl_df = pd.concat([combined_suppl_df, df_filtered], axis=1)
                     
-                else:
-                    sep = "\t" if data_file_name.endswith(".tsv") or data_file_name.endswith(".txt") else ","
-                    df = pd.read_csv(extracted_file, sep=sep, index_col=0)
-            else:
-                raise FileNotFoundError("No valid data file found inside the TAR archive.")
-    else:
-        sep = "\t" if file_url.endswith(".tsv") or data_file_name.endswith(".txt") else ","
-        df = pd.read_csv(raw, sep=sep, index_col=0)
+        except Exception as e:
+            print(f"[{geo_accession}] Error downloading/processing {file_url}: {e}")
 
-    print(f"[{geo_accession}] Matrix shape: {df.shape}")
-    print(f"[{geo_accession}] First few index values: {list(df.index[:5])}")
-    print(f"[{geo_accession}] Columns: {list(df.columns[:5])}")
+    if combined_suppl_df.empty:
+        return pd.DataFrame(), None
 
-    # Step 4: Normalize index to gene symbols using the GFF reference map
-    df = normalize_index_to_symbols(df, id_to_symbol, geo_accession)
-
-    # Step 5: filter to genes of interest
-    # Index may be gene names, b-numbers, or Ensembl IDs — inspect the print above
-    found = df.index.intersection(genes_of_interest)
-    missing = set(genes_of_interest) - set(found)
-    if missing:
-        print(f"[{geo_accession}] Genes not found: {missing}")
-
-    return df.loc[found]
+    # Handle duplicate column names if identical sample files were processed twice
+    combined_suppl_df = combined_suppl_df.loc[:, ~combined_suppl_df.columns.duplicated()]
+    combined_suppl_df = combined_suppl_df.groupby(combined_suppl_df.index).mean()
+    
+    print(f"[{geo_accession}] Final aggregated matrix shape: {combined_suppl_df.shape}")
+    return combined_suppl_df, None
 
 
 def get_expression_for_genes(
@@ -721,6 +806,11 @@ def get_expression_for_genes(
             gsm_name: gsm.table.set_index(probe_id_col)[value_col]
             for gsm_name, gsm in gse.gsms.items()
         })
+        
+        # Clean invisible spaces/commas and force SOFT table values to float64
+        expr_matrix = expr_matrix.astype(str).replace(r'[\xa0\r\t,]', '', regex=True)
+        expr_matrix = expr_matrix.apply(pd.to_numeric, errors='coerce')
+        
     except KeyError as e:
         raise KeyError(
             f"Column not found in GSM table. "
@@ -794,6 +884,10 @@ def get_expression(
     geo_accession: str,
     genes_of_interest: list[str],
     id_to_symbol: dict[str, str],
+    warn_file_size_mb: int = 512,
+    approved_files=None,
+    rejected_files=None,
+    series_title="",
     probe_id_col: str = None,
     value_col: str = None,
     gene_symbol_col: str = None,
@@ -824,7 +918,15 @@ def get_expression(
         )
     else:
         print(f"[{geo_accession}] Empty SOFT tables — using RNA-seq supplemental file path.")
-        return get_rnaseq_expression_for_genes(geo_accession, genes_of_interest, id_to_symbol)
+        return get_rnaseq_expression_for_genes(
+            geo_accession,
+            genes_of_interest,
+            id_to_symbol,
+            warn_file_size_mb,
+            approved_files,
+            rejected_files,
+            series_title
+        )
     
 def get_geo_series_metadata(gse_ids: list[str], ncbi_email: str):
     """
@@ -874,3 +976,200 @@ def get_geo_series_metadata(gse_ids: list[str], ncbi_email: str):
     
     print()
     return metadata_results
+
+
+def get_remote_file_size_mb(file_url: str) -> float | None:
+    """
+    Performs an HTTP HEAD request to fetch Content-Length without downloading the body.
+    Returns size in Megabytes (MB), or None if unavailable.
+    """
+    url = file_url.replace("ftp://", "https://")
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=10)
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            size_bytes = int(content_length)
+            return round(size_bytes / (1024 * 1024), 2)  # Convert bytes to MB
+    except Exception as e:
+        print(f"[Size Check Warning] Couldn't fetch size for {url}: {e}")
+    return None
+
+
+def detect_header_rows_and_parse_tabular(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Dynamically identifies and parses metadata/header rows in tabular data.
+    Strips comment lines, detects headers, drops known genomic metadata columns,
+    and retains only numeric sample data columns.
+    """
+    fn_lower = filename.lower()
+    header_rows_count = 0
+
+    # Row array extraction based on file extension
+    if fn_lower.endswith((".xls", ".xlsx")):
+        try:
+            # Read the full raw layout as a baseline matrix with no indexing columns or headers
+            raw_excel_df = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            # Transform rows into structural tokens to feed into the scanner loop
+            lines = raw_excel_df.astype(str).values.tolist()
+        except Exception as e:
+            print(f"  [Parser Error] Failed to read layout for Excel file {filename}: {e}")
+            return pd.DataFrame()
+    else:
+        # Decode text content
+        text_content = file_bytes.decode("utf-8", errors="ignore")
+        raw_lines = text_content.splitlines()
+        
+        # Strip out metadata comment lines starting with '#' or '!'
+        # '#' - metadata comments for featureCounts, VCFs, GFFs
+        # '!' - metadata comments for GEO SOFT files
+        clean_lines = [line for line in raw_lines if line.strip() and not line.strip().startswith(("#", "!"))]
+        
+        if not clean_lines:
+            return pd.DataFrame()
+        
+        # Re-encode clean text without comments
+        file_bytes = "\n".join(clean_lines).encode("utf-8")
+        
+        sep = "\t" if fn_lower.endswith((".tsv", ".txt")) else ","
+        # Keep tokens as raw string cells for checking
+        lines = [line.strip().split(sep) for line in clean_lines]
+
+    if not lines:
+        return pd.DataFrame()
+
+    # Scan rows to find where numeric data starts
+    for idx, tokens in enumerate(lines):
+        numeric_signals = []
+        # Check all cells starting from index 1 (ignoring column 0, which holds the gene identifier strings)
+        for token in tokens[1:]:
+            clean_token = str(token).strip()
+            # Catch standard empty cells or cosmetic N/A labels
+            if not clean_token or clean_token.lower() in ["n/a", "na", "nan", "null", "none", "."]:
+                continue
+            try:
+                float(clean_token)
+                numeric_signals.append(True)
+            except ValueError:
+                numeric_signals.append(False)
+        
+        # If row contains numeric gene expression values, the header block ends here
+        if numeric_signals and any(numeric_signals) and all(x for x in numeric_signals if x is True):
+            header_rows_count = idx
+            break
+            
+    print(f"  [Parser] Detected {header_rows_count} header/metadata row(s) in {filename}")
+
+    # Parsing final matrix with automatic multi-header assignment
+    try:
+        if fn_lower.endswith((".xls", ".xlsx")):
+            header_arg = list(range(header_rows_count)) if header_rows_count > 1 else (0 if header_rows_count == 1 else None)
+            df = pd.read_excel(io.BytesIO(file_bytes), header=header_arg, index_col=0)
+        else:
+            sep = "\t" if fn_lower.endswith((".tsv", ".txt")) else ","
+            header_arg = list(range(header_rows_count)) if header_rows_count > 1 else (0 if header_rows_count == 1 else None)
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, header=header_arg, index_col=0)
+    except Exception as e:
+        print(f"  [Parser Error] Failed to construct DataFrame from {filename}: {e}")
+        return pd.DataFrame()
+    
+    # Drop known genomic annotation columns by name (case-insensitive match)
+    genomic_metadata_cols = {
+        "chr", "chromosome", "seqid", "contig",
+        "start", "end", "stop", "strand", "length", 
+        "gene_length", "transcript_length", "biotype", "description"
+    }
+    
+    filtered_cols = []
+    for col in df.columns:
+        # Check standard string representation of column names
+        col_name_clean = str(col).strip().lower()
+        if col_name_clean not in genomic_metadata_cols:
+            filtered_cols.append(col)
+        else:
+            print(f"  [-] Dropping genomic metadata column: '{col}'")
+
+    df = df[filtered_cols]
+
+    # Keep remaining columns that contain numeric expression data
+    numeric_cols = []
+    for col in df.columns:
+        col_series = df[col]
+
+        # 1. Thoroughly clean string values if column is object type
+        if col_series.dtype == "object":
+            col_series = (
+                col_series.astype(str)
+                # Remove non-breaking spaces (\xa0), carriage returns, and commas in numbers (e.g. 1,234.5)
+                .str.replace(r'[\xa0\r\t]', '', regex=True)
+                .str.replace(',', '', regex=False)
+                .str.strip()
+            )
+            # Replace standard text representations of missing data
+            col_series = col_series.replace(["", "n/a", "N/A", "NA", "nan", "NaN", "null", "None", "-"], pd.NA)
+
+        # 2. Force conversion to float
+        converted = pd.to_numeric(col_series, errors='coerce')
+
+        # 3. Keep column if it contains valid numeric expression numbers
+        if converted.notna().sum() > 0:
+            df[col] = converted
+            numeric_cols.append(col)
+
+    if not numeric_cols:
+        print(f"  [Parser Warning] No numeric expression columns remaining in {filename}")
+        return pd.DataFrame()
+
+    return df[numeric_cols]
+
+
+def generate_formatted_matrix(df: pd.DataFrame, gse, geo_accession: str) -> pd.DataFrame:
+    """
+    Cleans raw data matrices and maps metadata to a MultiIndex column structure,
+    preserving the gene index for downstream concatenation.
+    """
+    # 1. Clean out cosmetic or statistical summary columns consistently
+    unwanted_keywords = ["average", "mean", "std", "avg", "unnamed"]
+    valid_cols = [col for col in df.columns if not any(kw in str(col).lower() for kw in unwanted_keywords)]
+    df = df.loc[:, valid_cols]
+    
+    # Drop rows or columns that are entirely unpopulated
+    df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+
+    # 2. Compile custom metadata alignment rows
+    geo_series_row  = []
+    gse_name_row    = []
+    geo_sample_row  = []
+    gsm_name_row    = []
+
+    for col in df.columns:
+        # If the column header is a tuple (due to detecting multi-row headers), extract the active text string
+        col_str = str(col[-1]).strip() if isinstance(col, tuple) else str(col).strip()
+        
+        gsm_obj = gse.gsms.get(col_str)
+        
+        # Fallback check: see if the column name can be tracked anywhere inside sample titles
+        if not gsm_obj:
+            for gsm_id, gsm in gse.gsms.items():
+                if gsm_id in col_str or col_str in gsm.metadata.get("title", [""])[0]:
+                    gsm_obj = gsm
+                    break
+
+        if gsm_obj:
+            geo_series_row.append(geo_accession)
+            gse_name_row.append(gse.metadata.get("title", [""])[0])
+            geo_sample_row.append(gsm_obj.name)
+            gsm_name_row.append(gsm_obj.metadata.get("title", [col_str])[0])
+        else:
+            geo_series_row.append(geo_accession)
+            gse_name_row.append(gse.metadata.get("title", [""])[0])
+            geo_sample_row.append(col_str)
+            gsm_name_row.append(col_str)
+
+    # 3. Apply MultiIndex columns, keeping Gene Symbols as the standard dataframe Index
+    export_df = df.copy()
+    export_df.columns = pd.MultiIndex.from_arrays(
+        [geo_series_row, gse_name_row, geo_sample_row, gsm_name_row],
+        names=["GSE Accession", "GSE Name", "GSM Accession", "GSM Name"]
+    )
+    
+    return export_df

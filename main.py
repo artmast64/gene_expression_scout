@@ -1,11 +1,14 @@
 # Gene Expression Scout
 
+from datetime import datetime
 from collections import Counter
+import json
 from pprint import pprint
 
 import pandas as pd
 from goatools.obo_parser import GODag
 import GEOparse
+import numpy as np
 
 import retrieve_go_terms
 import retrieve_genes_from_go_terms
@@ -42,39 +45,165 @@ def get_params():
     return gff_cache_dir, ncbi_email, category_map
 
 
-def print_settings(species, condition, gene_list, go_term_grouping, batch_size, min_depth, max_series_return):
+def print_settings(species, condition, gene_list, model_name, go_term_grouping, batch_size, min_depth, max_series_return, warn_file_size_mb, drop_unmatched_genes):
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("\n--- Settings: ---")
     print(f"  Species name: {species}")
     print(f"  Factor: {condition}")
     print(f"  List of genes: {gene_list}")
+    print(f"  LLM model name: {model_name}")
     print(f"  Gene Retrieval Method: {go_term_grouping}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Minimum GO Term Depth: {min_depth}")
     print(f"  Maximum GEO series results per keyword: {max_series_return}")
+    print(f"  Warning size for large supplementary files: {warn_file_size_mb} MB")
+    print(f"  Drop unmatched genes from expression matrix: {drop_unmatched_genes}")
     print()
 
 
-def identify_taxon(species: str):
-    # Lookup table of common species
+def identify_taxon(query: str, ncbi_email: str):
+    """
+    Identifies a NCBI Taxon ID for a given search query string.
+    
+    1. Looks up 'query' in `species_df` matching against scientific or common names.
+    2. If not found, queries NCBI's Taxonomy API via E-utilities.
+    
+    Returns:
+        str: Taxon ID (e.g., '562') if found/resolved, else None.
+    """
+    # --- Lookup table of common species ---
     # Replaced 562 with 83333 for E. coli
     species_df = pd.DataFrame({
         "Common Name": ["Mouse", "Human", "Rat", "Thale cress", "Zebrafish", "Fruit fly", "Baker's yeast", "Roundworm", "E. coli", "Cattle"],
         "Scientific Name": ["Mus musculus", "Homo sapiens", "Rattus norvegicus", "Arabidopsis thaliana", "Danio rerio", "Drosophilia melanogaster",
                             "Saccharomyces cerevisiae", "Caenorhabditis elegans", "Escherichia coli", "Bos taurus"],
-        "Taxon ID": [10090, 9606, 10116, 3702, 7955, 7227, 4932, 6239, 83333, 9913],
+        "Taxon ID": [10090, 9606, 10116, 3702, 7955, 7227, 4932, 6239, 562, 9913],
     })
 
-    # Find taxon ID from species name (try common name first, then scientific name)
+    # --- Check local species_df for matches ---
+    import re
+
+    if not query or not isinstance(query, str):
+        return None
+
+    raw_query = query.strip()
+    clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', raw_query).lower()
+    clean_query = " ".join(clean_query.split())  # collapse extra spaces
+
+    for _, row in species_df.iterrows():
+        com_name = re.sub(r'[^a-zA-Z0-9\s]', '', str(row["Common Name"])).lower()
+        sci_name = re.sub(r'[^a-zA-Z0-9\s]', '', str(row["Scientific Name"])).lower()
+        tax_id = str(row["Taxon ID"]).strip()
+
+        if clean_query in (com_name, sci_name):
+            print(f"[Taxon Lookup] Found local match in species_df: '{query}' -> TaxID {tax_id}")
+            return tax_id
+        
+    # --- Fallback to NCBI Taxonomy API ---
+    import requests
+
+    print(f"[Taxon Lookup] '{query}' not found locally. Querying NCBI Taxonomy API...")
+    
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    params = {
+        "db": "taxonomy",
+        "term": query,
+        "retmode": "json",
+        "tool": "streamlit_transcriptomics_app",
+        "email": ncbi_email
+    }
+
     try:
-        taxon_id = species_df.loc[species_df["Common Name"] == species, "Taxon ID"].values[0]
-    except:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        # Sanitize potential control characters from NCBI response
+        clean_text = re.sub(r'[\x00-\x1F\x7F]', '', response.text)
+        data = json.loads(clean_text)
+        
+        id_list = data.get("esearchresult", {}).get("idlist", [])
+        
+        if id_list:
+            ncbi_tax_id = str(id_list[0])
+            print(f"[Taxon Lookup] NCBI API resolved '{query}' -> TaxID {ncbi_tax_id}")
+            return ncbi_tax_id
+        else:
+            print(f"[Taxon Lookup] Warning: NCBI could not find a Taxon ID for '{query}'.")
+            return None
+
+    except Exception as e:
+        print(f"[Taxon Lookup] Error contacting NCBI Taxonomy API: {e}")
+        return None
+    
+
+def sanitize_matrix_to_floats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Scans the entire body of the expression matrix, strips leading/trailing
+    apostrophes or quotes, removes invisible whitespace/commas, forces all
+    values to native float64 types, and rounds to a specified precision to
+    prevent Excel string conversions.
+    """
+    def clean_cell(val):
+        if pd.isna(val):
+            return np.nan
+        
+        # If value is already a float or int, return directly
+        if isinstance(val, (int, float)):
+            return float(val)
+            
+        # Convert to string to clean characters
+        val_str = str(val).strip()
+        
+        # Strip literal leading/trailing apostrophes, single quotes, or double quotes
+        val_str = val_str.lstrip("'").rstrip("'").lstrip('"').rstrip('"').strip()
+        
+        # Strip non-breaking spaces (\xa0) and commas used in formatting (e.g. 1,234.56)
+        val_str = val_str.replace('\xa0', '').replace(',', '')
+        
+        # Handle empty strings or string representations of missing values
+        if val_str == "" or val_str.lower() in ["n/a", "na", "nan", "null", "none", "-"]:
+            return np.nan
+            
         try:
-            taxon_id = species_df.loc[species_df["Scientific Name"] == species, "Taxon ID"].values[0]
-        except:
-            print(f"Taxon ID not found for species '{species}'")
-            taxon_id = input("Type in the taxon ID for the species: ")
-    print(f"Taxon ID for {species}: {taxon_id}")
-    return taxon_id
+            return float(val_str)
+        except ValueError:
+            return np.nan
+
+    # Apply element-wise cleaning to the entire numeric body of the DataFrame
+    cleaned_df = df.map(clean_cell)
+
+    # Round float values to eliminate extreme floating-point artifacts (Excel threshold)
+    # 8 digits is reasonably precise (Maximum digits Excel can handle is 15)
+    cleaned_df = cleaned_df.round(8)
+    
+    # Cast entire DataFrame explicitly to float64
+    return cleaned_df.astype("float64")
+
+
+def finalize_expression_matrix(combined_df: pd.DataFrame, all_genes: list, drop_unmatched_genes: bool = False) -> pd.DataFrame:
+    """
+    Ensures all genes (original or generated) are included in the final output dataframe,
+    and sorts the gene list alphabetically.
+    """
+    # Ensure all input/added genes are present as rows (index)
+    all_genes_sorted = sorted(list(set(all_genes)))
+    
+    # Re-index the DataFrame to include all genes
+    # Genes missing from the expression matrix will have NaN values across samples
+    final_df = combined_df.reindex(index=all_genes_sorted)
+    
+    # Assign clean gene index name
+    final_df.index.name = "Gene_Symbol"
+
+    # Drop rows that contain NaN across all sample columns
+    # Check that user has drop_unmatched_genes set to True
+    if drop_unmatched_genes:
+        unmapped_count = final_df.isna().all(axis=1).sum()
+        if unmapped_count > 0:
+            print(f"[Matrix Post-Processing] Dropping {unmapped_count} genes with no expression data.")
+            final_df = final_df.dropna(how="all", axis=0)
+    
+    return final_df
 
 
 # --- Run ---
@@ -121,16 +250,8 @@ def run_retrieve_go_terms(gene_list, taxon_id, category_map, min_depth, batch_si
     print("\nFirst 20 GO terms:")
     print(df.head(20).to_string(index=False)) # <-- Print out all go terms instead? !!!
 
-    # Save to CSV <-- for testing !!!
-    df.to_csv("output_go_terms.csv", index=False)
-    print("\nSaved to output_go_terms.csv")
-
     return df, godag
 
-#go_df, godag = run_retrieve_go_terms(gene_list, taxon_id, category_map, min_depth, batch_size)
-
-
-#go_df = pd.read_csv("output_go_terms.csv") # <-- load saved .csv for testing !!!
 # --- Run ---
 def run_retrieve_genes_from_go_terms(go_df, taxon_id, godag, category_map, go_term_grouping, batch_size):
     print("--------------------------------------------")
@@ -169,16 +290,8 @@ def run_retrieve_genes_from_go_terms(go_df, taxon_id, godag, category_map, go_te
     # Unique new genes discovered
     new_genes = expanded_df["new_gene"].unique()
     print(f"\nUnique new genes discovered: {len(new_genes)}")
-    # print(sorted(new_genes))
-
-    # Save to .csv <-- for testing !!!
-    expanded_df.to_csv("output_expanded_genes.csv", index=False)
-    print("\nSaved to output_expanded_genes.csv")
 
     return expanded_df
-
-#expanded_df = run_retrieve_genes_from_go_terms(go_df, taxon_id, godag, category_map, go_term_grouping, batch_size)
-
 
 # --- Run ---
 def run_retrieve_experiment_keywords(condition, model_name, api_key):
@@ -190,18 +303,13 @@ def run_retrieve_experiment_keywords(condition, model_name, api_key):
 
     return condition_list
 
-#condition_list = run_retrieve_experiment_keywords(condition, model_name, api_key)
-
-
-# df = pd.read_csv("output_go_terms.csv") # <-- load saved .csv for testing !!!
-# expanded_df = pd.read_csv("output_expanded_genes.csv") # <-- load saved .csv for testing !!!
 # --- Run ---
-def run_retrieve_experiments(go_df, expanded_df, species, condition_list, ncbi_email, max_series_return):
+def run_retrieve_experiments(gene_list, expanded_df, species, condition_list, ncbi_email, max_series_return):
     print("------------------------------------------------------------------------")
     print("--- Step 4: Retrieve Experiments and Gene Expression Levels from GEO ---")
     print("------------------------------------------------------------------------")
 
-    original_genes = go_df["gene"].unique().tolist()
+    original_genes = list(set(gene_list))
     new_genes = expanded_df["new_gene"].unique().tolist()
     all_genes = list(set(original_genes + new_genes))
 
@@ -228,45 +336,79 @@ def run_retrieve_experiments(go_df, expanded_df, species, condition_list, ncbi_e
     return filtered_experiments, all_genes
 
 
-def run_retrieve_expression_levels(experiments, all_genes, species, gff_cache_dir, ncbi_email):
+def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_size_mb, drop_unmatched_genes, gff_cache_dir, ncbi_email,
+                                   approved_files=None, rejected_files=None):
     #series_metadata = retrieve_experiments_and_expression_levels.get_geo_series_metadata(seen_accessions, ncbi_email)
+
+    # Flags for large files
+    if approved_files is None:
+        approved_files = set()
+    if rejected_files is None:
+        rejected_files = set()
+    
     all_results = {}
 
     for exp in experiments:
         acc = exp["accession"]
-        print(f"Processing {acc}: {exp['title']}")
+        title = exp.get("title", "")
+        print(f"Processing {acc}: {title}")
+
         try:
             # Resolve the strain-specific GFF for this experiment so that locus
             # tags in the expression data are mapped using the correct assembly,
             # not a cross-strain approximation.
             gse = GEOparse.get_GEO(geo=acc, destdir="./geo_cache/", silent=True)
             #gse = series_metadata[acc]
+
+            # Resolve GFF symbol map
             id_to_symbol = retrieve_experiments_and_expression_levels.get_id_to_symbol_map_for_gse(gse, species, gff_cache_dir, ncbi_email)
             if not id_to_symbol:
                 print(f"[{acc}] Warning: no strain-specific GFF resolved — "
                     "locus tag normalisation will be skipped.")
     
-            df = retrieve_experiments_and_expression_levels.get_expression(acc, all_genes, id_to_symbol)
-            if not df.empty:
-                all_results[acc] = df
-                print(f"[{acc}] Success: {df.shape[0]} genes x {df.shape[1]} samples\n")
+            # Extract expression levels (includes file size logic)
+            # Pass user approvals/rejections into get_expression
+            df, pending_prompt = retrieve_experiments_and_expression_levels.get_expression(
+                geo_accession=acc,
+                genes_of_interest=all_genes,
+                id_to_symbol=id_to_symbol,
+                warn_file_size_mb=warn_file_size_mb,
+                approved_files=approved_files,
+                rejected_files=rejected_files,
+                series_title=title
+            )
+
+            # If a file was hit that needs approval, stop immediately and return information back to Streamlit
+            if pending_prompt:
+                print(f"[{acc}] Execution paused: Large file pending approval.")
+                return pd.DataFrame(), pending_prompt
+
+            # Format matrix if data was successfully fetched
+            if df is not None and not df.empty:
+                # Force entire DataFrame to float64 to purge any lingering string types
+                df = df.apply(pd.to_numeric, errors='coerce')
+                df = retrieve_experiments_and_expression_levels.generate_formatted_matrix(df, gse, acc)
+                if not df.empty:
+                    all_results[acc] = df
+                    print(f"[{acc}] Success: {df.shape[0]} genes x {df.shape[1]} samples\n")
             else:
-                print(f"[{acc}] Returned empty DataFrame — check supplemental files.\n")
+                print(f"[{acc}] Skipped or empty DataFrame.\n")
+
         except Exception as e:
             print(f"[{acc}] Failed: {e}\n")
 
-    # Combine across studies (genes as rows, multi-index columns by study+sample)
+    # Combine all collected matrices
     if all_results:
-        combined_df = pd.concat(all_results, axis=1)
-        print("First 5 rows of combined dataset:")
-        print(combined_df.head())
+        # Concatenate on axis=1 using the gene names as the joining index anchor
+        combined_df = pd.concat(all_results.values(), axis=1)
 
-        # Export to .csv file
-        combined_df.to_csv("output_expression_matrix.csv")
-        print(f"\nSaved combined matrix: {combined_df.shape}")
-        print("Saved to output_expression_matrix.csv")
+        # Clean and force all matrix cells to native numeric float64
+        combined_df = sanitize_matrix_to_floats(combined_df)
 
-        return combined_df
+        # Make sure all genes (original or generated) are included and sorted alphabetically
+        combined_df = finalize_expression_matrix(combined_df, all_genes, drop_unmatched_genes)
 
-#experiments, all_genes = run_retrieve_experiments(all_genes, species, condition_list, ncbi_email, max_series_return)
-#combined_df = run_retrieve_expression_levels(experiments, all_genes, species, gff_cache_dir, ncbi_email)
+        print(f"Returning combined matrix dataframe: {combined_df.shape}")
+        return combined_df, None
+    
+    return pd.DataFrame(), None

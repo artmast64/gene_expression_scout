@@ -39,6 +39,10 @@ def retrieve_exp_keys(keyword: str, model_name: str, api_key: str):
         
         Keep the terms precise for NCBI GEO query optimization. Do not include organism names. Do not include boolean operators like AND/OR. 
         """
+        # Print the prompt to the log file
+        print(f"Model name: {model_name}")
+        print("Prompt:")
+        print(prompt)
         
         response = structured_llm.invoke(prompt)
         return {"search_terms": response.expanded_keywords}
@@ -54,7 +58,7 @@ def retrieve_exp_keys(keyword: str, model_name: str, api_key: str):
 
     # Execute the System
     initial_state = {"user_keyword": keyword}
-    print("LLM responding...")
+    print("\nLLM responding...")
     result = geo_keyword_graph.invoke(initial_state)
 
     print(f"Original: {result["user_keyword"]}")
