@@ -23,6 +23,8 @@ if "species_input" not in st.session_state:
     st.session_state.species_input = ""
 if "gene_list_input" not in st.session_state:
     st.session_state.gene_list_input = ""
+if "ncbi_email_input" not in st.session_state:
+    st.session_state.ncbi_email_input = ""
 if "processing_active" not in st.session_state:
     st.session_state.processing_active = False
 if "zip_file_bytes" not in st.session_state:
@@ -226,6 +228,7 @@ def clear_form_callback():
     st.session_state.condition_input = ""
     st.session_state.species_input = ""
     st.session_state.gene_list_input = ""
+    st.session_state.ncbi_email_input = ""
 
 with st.form(key="gene_list_form", clear_on_submit=False):
     
@@ -233,6 +236,10 @@ with st.form(key="gene_list_form", clear_on_submit=False):
     st.text_input("Species name", key="species_input")
     st.text_area("List of gene symbols (case-sensitive)", placeholder="Ex: BRCA1 TP53 TNF", key="gene_list_input")
     st.markdown("*Paste your list of gene symbols in any format. Spaces, commas, new lines, quotes, and special characters will be handled automatically.*")
+    st.text_input("Email address (required by NCBI's API)", key="ncbi_email_input",
+                  help="""
+                  For programmatic access to data, NCBI requires users to provide an email address.
+                  """)
 
     col1, col2, col3 = st.columns([1,1,10]) # Push buttons closer together
     with col1:
@@ -255,7 +262,10 @@ if st.session_state.processing_active:
         st.error("List of gene symbols is required!")
         st.session_state.processing_active = False
     elif not st.session_state.llm_api_key:
-        st.error("LLM API key! is required!")
+        st.error("LLM API key is required!")
+        st.session_state.processing_active = False
+    elif not st.session_state.ncbi_email_input:
+        st.error("Email address is required!")
         st.session_state.processing_active = False
     
     else:
@@ -277,6 +287,7 @@ if st.session_state.processing_active:
                     for gene in re.split(r'[\s,;|\\/\[\]()"\']+', st.session_state.gene_list_input) 
                     if gene.strip()
                 ]
+                ncbi_email = st.session_state.ncbi_email_input
 
                 model_name = st.session_state.model_name
                 api_key = st.session_state.llm_api_key

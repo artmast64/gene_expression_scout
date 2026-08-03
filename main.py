@@ -5,6 +5,8 @@ from collections import Counter
 import json
 from pprint import pprint
 
+import streamlit as st
+import requests
 import pandas as pd
 from goatools.obo_parser import GODag
 import GEOparse
@@ -137,6 +139,21 @@ def identify_taxon(query: str, ncbi_email: str):
     except Exception as e:
         print(f"[Taxon Lookup] Error contacting NCBI Taxonomy API: {e}")
         return None
+
+
+@st.cache_resource
+def load_godag():
+    obo_url = "http://current.geneontology.org/ontology/go-basic.obo"
+    obo_filename = "go-basic.obo"
+    # Download file if it doesn't exist locally on the cloud server
+    if not os.path.exists(obo_filename):
+        with st.spinner("Downloading Gene Ontology data (one-time setup)..."):
+            response = requests.get(obo_url)
+            with open(obo_filename, "wb") as f:
+                f.write(response.content)
+    
+    # Load and return the GO DAG object
+    return GODag(obo_filename)
     
 
 def sanitize_matrix_to_floats(df: pd.DataFrame) -> pd.DataFrame:
@@ -218,7 +235,7 @@ def run_retrieve_go_terms(gene_list, taxon_id, category_map, min_depth, batch_si
     all_records = retrieve_go_terms.fetch_all_go_terms(gene_list, taxon_id, category_map)
     
     # Filter out GO terms by depth
-    godag = GODag("go-basic.obo") # Open OBO file (Download once before running: http://purl.obolibrary.org/obo/go/go-basic.obo)
+    godag = load_godag() # Open OBO file
     all_records = retrieve_go_terms.filter_records_by_depth(all_records, godag, min_depth)
 
     df = pd.DataFrame(all_records)
@@ -278,7 +295,7 @@ def run_retrieve_genes_from_go_terms(go_df, taxon_id, godag, category_map, go_te
     term_counts = Counter(all_go_ids)
 
     if "godag" not in globals() or not godag:
-        godag = GODag("go-basic.obo")
+        godag = load_godag()
     print("Top 10 GO terms by new genes added:")
     for go_id, count in term_counts.most_common(10):
         term = godag.get(go_id)
