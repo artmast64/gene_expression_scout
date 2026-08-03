@@ -23,9 +23,6 @@ import retrieve_experiments_and_expression_levels
 #min_depth = 4
 #max_series_return = 50
 
-#model_name = "gemini-2.5-flash"
-#api_key = "AQ.Ab8RN6J4ptcINnUhIf3jd_f5JpcpkjF6isW0tYKGFi0dz_YVcg"
-
 def get_params():
     # GFF files are downloaded per-experiment based on the strain detected in GEO metadata.
     # They are cached locally by assembly accession to avoid repeat downloads.
