@@ -484,7 +484,7 @@ def find_geo_experiments(species: str, condition: str, ncbi_email: str, retmax: 
 
     # Call GEO API
     print(f"\nSearching GEO for condition '{condition}' and species '{species}'...")
-    search_resp = requests.get(f"{eutils_url}/esearch.fcgi", params=search_params)
+    search_resp = requests.get(f"{eutils_url}/esearch.fcgi", params=search_params, timeout=30)
     search_resp.raise_for_status()
     search_data = search_resp.json()
 
@@ -635,10 +635,11 @@ def get_rnaseq_expression_for_genes(
     geo_accession: str,
     genes_of_interest: list[str],
     id_to_symbol: dict[str, str],
-    warn_file_size_mb: int = 512,
+    warn_file_size_gb: int = 1,
     approved_files=None,
     rejected_files=None,
     series_title="",
+    supp_cache_dir: str = "supp_cache",
 ) -> tuple[pd.DataFrame, dict | None]:
     """
     For RNA-seq GSE accessions where GEOparse returns empty tables,
@@ -673,6 +674,10 @@ def get_rnaseq_expression_for_genes(
     
     combined_suppl_df = pd.DataFrame()
 
+    # Create GSE-specific subdirectory inside the supplementary cache folder
+    gse_supp_dir = os.path.join(supp_cache_dir, geo_accession)
+    os.makedirs(gse_supp_dir, exist_ok=True)
+
     for file_url in candidates:
         # Check if user rejected this file earlier
         if file_url in rejected_files:
@@ -681,32 +686,62 @@ def get_rnaseq_expression_for_genes(
 
         filename = os.path.basename(file_url)
         download_url = file_url.replace("ftp://", "https://")
+        local_filepath = os.path.join(gse_supp_dir, filename)
 
-        # Check file size before downloading the entire file
-        size_mb = get_remote_file_size_mb(file_url)
+        content_bytes = None
 
-        if size_mb and size_mb > warn_file_size_mb:
-            if file_url not in approved_files:
-                print(f"[{geo_accession}] Large file detected ({size_mb} MB). Requesting user approval...")
-                prompt_info = {
-                    "series": f"{geo_accession}: {series_title}",
-                    "filename": filename,
-                    "url": file_url,
-                    "size_mb": size_mb
-                }
-                # Pause and return prompt to caller
-                return pd.DataFrame(), prompt_info               
-            
-        print("  ↳")
-        print(f"[{geo_accession}] Processing supplemental root file entry: {file_url}")
-        print(f"[{geo_accession}] File size {file_url} ({size_mb} MB)")
+        # 1. Check local cache first
+        if os.path.exists(local_filepath):
+            print(f"[{geo_accession}] [SUPP CACHE HIT] Loading locally cached supplementary file: {local_filepath}")
+            try:
+                with open(local_filepath, "rb") as f:
+                    content_bytes = f.read()
+            except Exception as e:
+                print(f"[{geo_accession}] Failed reading cached file {local_filepath}: {e}")
 
+        # 2. Download if not cached
+        if content_bytes is None:
+            # Check remote file size before downloading
+            size_gb = get_remote_file_size_gb(file_url)
+
+            if size_gb and size_gb > warn_file_size_gb:
+                if file_url not in approved_files:
+                    print(f"[{geo_accession}] Large file detected ({size_gb} GB). Requesting user approval...")
+                    prompt_info = {
+                        "series": f"{geo_accession}: {series_title}",
+                        "filename": filename,
+                        "url": file_url,
+                        "size_gb": size_gb
+                    }
+                    # Pause and return prompt to caller
+                    return pd.DataFrame(), prompt_info               
+                
+            print("  ↳")
+            print(f"[{geo_accession}] Processing supplemental root file entry: {file_url}")
+            print(f"[{geo_accession}] File size {file_url} ({size_gb} GB)")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+
+            try:
+                response = requests.get(download_url, headers=headers, timeout=90)
+                response.raise_for_status()
+                content_bytes = response.content
+
+                # Save file to local cache subdirectory
+                with open(local_filepath, "wb") as f:
+                    f.write(content_bytes)
+                print(f"[{geo_accession}] Saved supplementary file to cache: {local_filepath}")
+
+            except Exception as e:
+                print(f"[{geo_accession}] Error downloading/processing {file_url}: {e}")
+                continue
+
+        # 3. Unpack and parse metrics
         try:
-            response = requests.get(download_url, timeout=90)
-            response.raise_for_status()
-            
             # Unpack all potential nested data tables
-            all_files = extract_nested_files(response.content, filename)
+            all_files = extract_nested_files(content_bytes, filename)
             
             for fname, fbytes in all_files:
                 is_valid_format = fname.lower().endswith((".csv", ".tsv", ".txt", ".xls", ".xlsx"))
@@ -724,13 +759,9 @@ def get_rnaseq_expression_for_genes(
 
                 # Disambiguate generic column names (e.g. "Count") using file names
                 sample_label = os.path.splitext(fname)[0] # Extract filename without extension
-                
                 # If there's only 1 column and it has a non-unique generic name, rename it to sample_label
                 generic_names = {"count", "counts", "readcount", "read_count", "val", "value", "expression", "fpkm", "tpm"}
-                renamed_cols = {}
-                for col in df.columns:
-                    if str(col).strip().lower() in generic_names:
-                        renamed_cols[col] = sample_label
+                renamed_cols = {col: sample_label for col in df.columns if str(col).strip().lower() in generic_names}
                 if renamed_cols:
                     df = df.rename(columns=renamed_cols)
                 
@@ -748,7 +779,7 @@ def get_rnaseq_expression_for_genes(
                     combined_suppl_df = pd.concat([combined_suppl_df, df_filtered], axis=1)
                     
         except Exception as e:
-            print(f"[{geo_accession}] Error downloading/processing {file_url}: {e}")
+            print(f"[{geo_accession}] Error unpacking/processing contents of {filename}: {e}")
 
     if combined_suppl_df.empty:
         return pd.DataFrame(), None
@@ -884,13 +915,14 @@ def get_expression(
     geo_accession: str,
     genes_of_interest: list[str],
     id_to_symbol: dict[str, str],
-    warn_file_size_mb: int = 512,
+    warn_file_size_gb: int = 1,
     approved_files=None,
     rejected_files=None,
     series_title="",
     probe_id_col: str = None,
     value_col: str = None,
     gene_symbol_col: str = None,
+    supp_cache_dir: str = "supp_cache",
 ) -> pd.DataFrame:
     """
     Dispatcher: automatically routes to microarray or RNA-seq path
@@ -922,74 +954,30 @@ def get_expression(
             geo_accession,
             genes_of_interest,
             id_to_symbol,
-            warn_file_size_mb,
+            warn_file_size_gb,
             approved_files,
             rejected_files,
-            series_title
+            series_title,
+            supp_cache_dir,
         )
-    
-def get_geo_series_metadata(gse_ids: list[str], ncbi_email: str):
-    """
-    Retrieves GEO metadata for multiple GSE accessions using a single API call.
-    """
-    metadata_results = {}
-    clean_gse_uids = []
-
-    # Prepare to fetch from NCBI. Convert GSE string to numerical UID string
-    for gse in gse_ids:
-        # Example: "GSE11111" -> "200011111"
-        if gse.startswith("GSE"):
-            numeric_part = gse[3:]                # Extract numbers (e.g., "1234")
-            padded_numeric = numeric_part.zfill(6)      # Pads out with zeros (e.g., "001234")
-            uid = "200" + padded_numeric                # Result is always 9 digits: "200001234"
-            clean_gse_uids.append(uid)
-
-    # Fetch records in a single bulk request
-    id_string = ",".join(clean_gse_uids)
-    
-    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-    params = {
-        "db": "gds",
-        "id": id_string,
-        "retmode": "json",
-        "email": ncbi_email
-    }
-
-    print(f"Fetching metadata for {len(clean_gse_uids)} GEO series...")
-
-    try:
-        response = requests.get(base_url, params=params, timeout=30)
-        response.raise_for_status()
-        raw_data = response.json().get("result", {})
-        
-        # Align and cache retrieved records
-        for uid in clean_gse_uids:
-            if uid in raw_data:
-                entry = raw_data[uid]
-                
-                metadata_results[entry.get("accession")] = entry
-            else:
-                print(f"Warning: Accession {uid} not found at NCBI.")
-                
-    except requests.exceptions.RequestException as e:
-        print(f"Network error trying to fetch metadata: {e}")
-    
-    print()
-    return metadata_results
 
 
-def get_remote_file_size_mb(file_url: str) -> float | None:
+def get_remote_file_size_gb(file_url: str) -> float | None:
     """
     Performs an HTTP HEAD request to fetch Content-Length without downloading the body.
-    Returns size in Megabytes (MB), or None if unavailable.
+    Returns size in Gigabytes (GB), or None if unavailable.
     """
     url = file_url.replace("ftp://", "https://")
+    # Note: look into using API keys instead of modifying the header - it allows for more frequent requests to NCBI/GEO and may remove HTTP 403 errors
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
+        response = requests.head(url, headers=headers, allow_redirects=True, timeout=(5,30)) # 5 seconds to connect, 30 to return headers for large files
         content_length = response.headers.get("Content-Length")
         if content_length:
             size_bytes = int(content_length)
-            return round(size_bytes / (1024 * 1024), 2)  # Convert bytes to MB
+            return round(size_bytes / (1024 * 1024 * 1024), 2)  # Convert bytes to GB
     except Exception as e:
         print(f"[Size Check Warning] Couldn't fetch size for {url}: {e}")
     return None

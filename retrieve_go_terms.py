@@ -157,17 +157,69 @@ def get_go_depths(go_ids: list[str], godag) -> dict[str, int]:
         }
     return results
 
+
 def filter_records_by_depth(records: list[dict], godag, min_depth: int = 0) -> list[dict]:
     """
     Given a flat list of GO annotation records (each with a "go_id" key),
     fetches depths for all unique GO IDs in one batched pass,
-    then filters out records below min_depth.
+    then tags records as 'kept' or 'removed' based on the minimum GO term depth.
     """
     # Collect unique GO IDs across all records
     unique_go_ids = list({r["go_id"] for r in records if r.get("go_id")})
     print(f"\nFetching depths for {len(unique_go_ids)} unique GO terms...")
 
     depth_info = get_go_depths(unique_go_ids, godag)
+
+    # Track minimum depth per input gene (before filtering)
+    gene_depths: dict[str, list[int]] = {}
+    all_processed_records = []
+    removed_count = 0
+    kept_count = 0
+
+    for record in records:
+        go_id = record.get("go_id")
+        gene = record.get("gene", "Unknown")
+        info = depth_info.get(go_id)
+
+        if info is None:
+            continue
+
+        depth = info["depth"]
+        
+        # Collect depth per gene
+        if gene not in gene_depths:
+            gene_depths[gene] = []
+        gene_depths[gene].append(depth)
+
+        # Mark status instead of discarding removed records
+        if depth >= min_depth:
+            status = "kept"
+            kept_count += 1
+        else:
+            status = "removed"
+            removed_count += 1
+
+        # Append record with depth, level, and status
+        all_processed_records.append({
+            **record,
+            "go_depth": depth,
+            "go_level": info["level"],
+            "status": status
+        })
+
+    # Print the minimum depth found for each input gene
+    print("\nMinimum GO Term Depth Per Input Gene:")
+    for gene, depths in gene_depths.items():
+        min_d = min(depths) if depths else "N/A"
+        print(f"  Gene '{gene}': minimum depth = {min_d}")
+
+    print(f"\nTagged {kept_count} records as 'kept' (depth >= {min_depth})")
+    print(f"Tagged {removed_count} records as 'removed' (depth < {min_depth})")
+
+    # Return ALL records so they stay in go_df for the CSV export
+    return all_processed_records
+
+
 
     # Filter records
     filtered = []

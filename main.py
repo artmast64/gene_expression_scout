@@ -17,7 +17,7 @@ import retrieve_experiments_and_expression_levels
 
 # Default settings
 #go_term_grouping = "none" # none, categories, all
-#batch_size = 50
+#batch_size = 250
 #min_depth = 4
 #max_series_return = 50
 
@@ -28,6 +28,9 @@ def get_params():
     # GFF files are downloaded per-experiment based on the strain detected in GEO metadata.
     # They are cached locally by assembly accession to avoid repeat downloads.
     gff_cache_dir = "gff_cache"
+
+    # Supplementary files cache
+    supp_cache_dir = "supp_cache"
 
     # Register your email with NCBI (required by their usage policy)
     ncbi_email = "bjohnsonhill@oakland.edu" # <-- TEMPORARY email !!!
@@ -42,10 +45,10 @@ def get_params():
         "C": "Cellular Component",
     }
 
-    return gff_cache_dir, ncbi_email, category_map
+    return gff_cache_dir, supp_cache_dir, ncbi_email, category_map
 
 
-def print_settings(species, condition, gene_list, model_name, go_term_grouping, batch_size, min_depth, max_series_return, warn_file_size_mb, drop_unmatched_genes):
+def print_settings(species, condition, gene_list, model_name, go_term_grouping, batch_size, min_depth, max_series_return, warn_file_size_gb, drop_unmatched_genes):
     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("\n--- Settings: ---")
     print(f"  Species name: {species}")
@@ -56,7 +59,7 @@ def print_settings(species, condition, gene_list, model_name, go_term_grouping, 
     print(f"  Batch Size: {batch_size}")
     print(f"  Minimum GO Term Depth: {min_depth}")
     print(f"  Maximum GEO series results per keyword: {max_series_return}")
-    print(f"  Warning size for large supplementary files: {warn_file_size_mb} MB")
+    print(f"  Warning size for large supplementary files: {warn_file_size_gb} MB")
     print(f"  Drop unmatched genes from expression matrix: {drop_unmatched_genes}")
     print()
 
@@ -238,7 +241,7 @@ def run_retrieve_go_terms(gene_list, taxon_id, category_map, min_depth, batch_si
 
     print(f"\nEntries found for genes: {matched_genes}")
     print(f"No entries found for genes: {unmatched_genes}")
-    print(f"Total GO annotations retrieved: {len(df)}")
+    print(f"\nTotal GO annotations retrieved: {len(df)}")
     print(f"Unique GO annotations retrieved: {len(df["go_id"].unique().tolist())}")
 
     # Calculate how many of each type of GO term was found
@@ -249,6 +252,7 @@ def run_retrieve_go_terms(gene_list, taxon_id, category_map, min_depth, batch_si
     # Print out first 20 GO terms
     print("\nFirst 20 GO terms:")
     print(df.head(20).to_string(index=False)) # <-- Print out all go terms instead? !!!
+    print()
 
     return df, godag
 
@@ -265,8 +269,13 @@ def run_retrieve_genes_from_go_terms(go_df, taxon_id, godag, category_map, go_te
 
     print(f"\nTotal new gene GO associations found: {len(expanded_df)}\n")
 
+    # Split piped IDs so Counter counts individual terms accurately
+    all_go_ids = []
+    for item in expanded_df["source_go_id"].dropna():
+        all_go_ids.extend(str(item).split("|"))
+
     # Count number of genes from each GO term
-    term_counts = Counter(expanded_df["source_go_id"])
+    term_counts = Counter(all_go_ids)
 
     if "godag" not in globals() or not godag:
         godag = GODag("go-basic.obo")
@@ -336,10 +345,8 @@ def run_retrieve_experiments(gene_list, expanded_df, species, condition_list, nc
     return filtered_experiments, all_genes
 
 
-def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_size_mb, drop_unmatched_genes, gff_cache_dir, ncbi_email,
-                                   approved_files=None, rejected_files=None):
-    #series_metadata = retrieve_experiments_and_expression_levels.get_geo_series_metadata(seen_accessions, ncbi_email)
-
+def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_size_gb, drop_unmatched_genes, gff_cache_dir, supp_cache_dir,
+                                   ncbi_email, approved_files=None, rejected_files=None):
     # Flags for large files
     if approved_files is None:
         approved_files = set()
@@ -347,18 +354,22 @@ def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_si
         rejected_files = set()
     
     all_results = {}
+    processed_accessions = set()
 
     for exp in experiments:
         acc = exp["accession"]
         title = exp.get("title", "")
         print(f"Processing {acc}: {title}")
+        print(f"[{acc}] GEO Series URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={acc}")
 
         try:
             # Resolve the strain-specific GFF for this experiment so that locus
             # tags in the expression data are mapped using the correct assembly,
             # not a cross-strain approximation.
             gse = GEOparse.get_GEO(geo=acc, destdir="./geo_cache/", silent=True)
-            #gse = series_metadata[acc]
+
+            # Record this GSE accession as processed in this run
+            processed_accessions.add(acc)
 
             # Resolve GFF symbol map
             id_to_symbol = retrieve_experiments_and_expression_levels.get_id_to_symbol_map_for_gse(gse, species, gff_cache_dir, ncbi_email)
@@ -372,16 +383,17 @@ def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_si
                 geo_accession=acc,
                 genes_of_interest=all_genes,
                 id_to_symbol=id_to_symbol,
-                warn_file_size_mb=warn_file_size_mb,
+                warn_file_size_gb=warn_file_size_gb,
                 approved_files=approved_files,
                 rejected_files=rejected_files,
-                series_title=title
+                series_title=title,
+                supp_cache_dir=supp_cache_dir,
             )
 
             # If a file was hit that needs approval, stop immediately and return information back to Streamlit
             if pending_prompt:
                 print(f"[{acc}] Execution paused: Large file pending approval.")
-                return pd.DataFrame(), pending_prompt
+                return pd.DataFrame(), pending_prompt, processed_accessions
 
             # Format matrix if data was successfully fetched
             if df is not None and not df.empty:
@@ -409,6 +421,6 @@ def run_retrieve_expression_levels(experiments, all_genes, species, warn_file_si
         combined_df = finalize_expression_matrix(combined_df, all_genes, drop_unmatched_genes)
 
         print(f"Returning combined matrix dataframe: {combined_df.shape}")
-        return combined_df, None
+        return combined_df, None, processed_accessions
     
-    return pd.DataFrame(), None
+    return pd.DataFrame(), None, processed_accessions

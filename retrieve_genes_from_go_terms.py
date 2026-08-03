@@ -2,6 +2,7 @@
 
 import time
 from io import StringIO
+import json
 
 import requests
 import pandas as pd
@@ -51,55 +52,66 @@ def fetch_go_annotations(go_ids, taxon_id, original_genes, domain_id, aspect=Non
     """
     base_url = "https://www.ebi.ac.uk/QuickGO/services/annotation/downloadSearch"
 
-    params = {
+    payload = {
         "goId": ",".join(go_ids),
-        "taxonId": taxon_id,
+        "taxonId": str(taxon_id),
         "goUsage": "exact",   # restrict to the exact GO terms only, no descendants
         "geneProductType": "protein",   # filter out non-genes/non-proteins
         "includeFields": "goName",
-        "selectedFields": "geneProductId,symbol,qualifier,goId,goName,goAspect,evidenceCode,goEvidence,reference,withFrom,taxonId,assignedBy,extensions,date",
+        "selectedFields": "geneProductId,symbol,qualifier,goId,goName,goAspect,evidenceCode,goEvidence,reference,withFrom,taxonId,assignedBy,extensions,date"
     }
     if aspect:
-        params["aspect"] = aspect
+        payload["aspect"] = aspect
 
-    headers = {"Accept": "text/tsv"}
+    # Accept header specifies the TSV output format
+    headers = {
+        "Accept": "text/tsv"
+    }
 
-    print("Downloading GO terms...")
-    response = requests.get(base_url, params=params, headers=headers, timeout=120)
-
-    if response.status_code != 200:
-        print("Request URL:", response.url)
-        print("Response body:", response.text)
+    print("Downloading new genes...")
+    try:
+        response = requests.post(base_url, params=payload, headers=headers, timeout=60)
         response.raise_for_status()
+        
+        # Read the TSV response stream directly into a Pandas DataFrame
+        df = pd.read_csv(StringIO(response.text), sep="\t")
 
-    df = pd.read_csv(StringIO(response.text), sep="\t")
+        records = []
+        
+        for _, row in df.iterrows():
+            symbol = str(row.get("SYMBOL", "")) if pd.notna(row.get("SYMBOL")) else str(row.get("GENE PRODUCT ID", ""))
+            if not symbol or symbol == "nan":
+                symbol = str(row.get("GENE PRODUCT ID", ""))
 
-    records = []
+            gene_name = symbol.split("_")[0] if "_" in symbol else symbol
 
-    for _, row in df.iterrows():
-        symbol = row.get("SYMBOL") or row.get("GENE PRODUCT ID", "")
-        gene_name = symbol.split("_")[0] if "_" in symbol else symbol
-
-        if gene_name.lower() in original_genes:
-            continue
-
-        # If bacteria, skip if first character is uppercase — likely a protein, not a gene
-        if domain_id == 2:  # 2 = "Bacteria"
-            if not gene_name or not gene_name[0].islower():
+            # Skip initial input genes
+            if gene_name.lower() in original_genes:
                 continue
+    
+            # If bacteria, skip if first character is uppercase — likely a protein, not a gene
+            if domain_id == 2: # Bacteria
+                if not gene_name or not gene_name[0].islower():
+                    continue
 
-        records.append({
-            "source_go_id":  row.get("GO TERM", ""),
-            "go_term":       row.get("GO NAME", ""),
-            "go_category":   row.get("GO ASPECT", ""),
-            "new_gene":      gene_name,
-            "uniprot_id":    row.get("GENE PRODUCT ID", ""),
-            "evidence_code": row.get("GO EVIDENCE CODE", ""),
-        })
-    return records
+            # Fallbakcs for TSV column names returned by QuickGO
+            go_name_val = row.get("GO NAME", row.get("GO TERM NAME", row.get("GO Name", "")))
 
+            records.append({
+                "source_go_id":  str(row.get("GO TERM", "")),
+                "go_term":       str(go_name_val),
+                "go_category":   str(row.get("GO ASPECT", "")),
+                "new_gene":      gene_name,
+                "uniprot_id":    str(row.get("GENE PRODUCT ID", "")),
+                "evidence_code": str(row.get("GO EVIDENCE CODE", row.get("EVIDENCE CODE", ""))),
+            })
+        return records
 
-def get_genes_for_go_term(go_ids: list[str] | str, original_genes: set[str], taxon_id: int, domain_id: int, batch_size: int = 5) -> list[dict]:
+    except requests.exceptions.RequestException as e:
+        print(f"Error querying QuickGO API: {e}")
+        return []
+
+def get_genes_for_go_term(go_ids: list[str] | str, original_genes: set[str], taxon_id: int, domain_id: int, batch_size: int = 250) -> list[dict]:
     """
     Query QuickGO for all genes annotated with any of the given
     GO terms. Accepts either a single GO ID string or a list of GO IDs,
@@ -145,8 +157,7 @@ def get_genes_for_go_term_set(
     original_genes: set[str],
     taxon_id: int,
     domain_id: int,
-    batch_size: int = 5,
-    max_pages: int = 5,
+    batch_size: int = 250,
 ) -> set[str]:
     """
     Retrieves genes annotated with ALL GO terms in the given set,
@@ -175,7 +186,7 @@ def get_genes_for_go_term_set(
     }
 
 
-def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_grouping: str, domain_id: int, batch_size: int = 5) -> pd.DataFrame:
+def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_grouping: str, domain_id: int, batch_size: int = 250) -> pd.DataFrame:
     """
     Takes the GO term DataFrame from Step 1 and retrieves all additional
     E. coli genes associated with each unique GO term.
@@ -188,30 +199,36 @@ def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_group
       categories — for each original gene, retrieve only genes annotated
                    with the same exact combinations of GO term category as that gene
     """
+    # Filter go_df to only use 'kept' terms for expanding new genes
+    if "status" in go_df.columns:
+        active_go_df = go_df[go_df["status"] == "kept"].copy()
+    else:
+        active_go_df = go_df.copy()
+
     # Exclude original genes from results
-    original_genes = set(go_df["gene"].str.lower().unique())
+    original_genes = set(active_go_df["gene"].str.lower().unique())
     print(f"\noriginal_genes: {original_genes}")
 
     all_records    = []
 
     if go_term_grouping == "none":
-        unique_go_ids = go_df["go_id"].dropna().unique().tolist()
+        unique_go_ids = active_go_df["go_id"].dropna().unique().tolist()
         print(f"\nGo term grouping: {go_term_grouping}")
         print(f"Querying {len(unique_go_ids)} unique GO terms...\n")
         records = get_genes_for_go_term(unique_go_ids, original_genes, taxon_id, domain_id, batch_size)
         all_records.extend(records)
     
-    elif go_term_grouping == "all" or go_term_grouping == "categories":
-        # Group GO terms by original gene
+    elif go_term_grouping in ["all", "categories"]:
+        # Group GO terms by original gene (and GO category)
         if go_term_grouping == "all":
             gene_go_groups = (
-                go_df.groupby("gene")["go_id"]
+                active_go_df.groupby("gene")["go_id"]
                 .apply(lambda x: sorted(x.dropna().unique().tolist()))
                 .to_dict()
             )
-        if go_term_grouping == "categories":
+        elif go_term_grouping == "categories":
             gene_go_groups = (
-                go_df.groupby(["gene", "go_category"])["go_id"]
+                active_go_df.groupby(["gene", "go_category"])["go_id"]
                 .apply(lambda x: sorted(x.dropna().unique().tolist()))
                 .to_dict()
             )
@@ -231,14 +248,15 @@ def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_group
             print(f"  Finding genes sharing all {len(gene_go_ids)} GO terms "
                 f"of {gene}: {gene_go_ids}")
             try:
-                matched_genes = get_genes_for_go_term_set(gene_go_ids, original_genes, taxon_id, domain_id)
+                # Large batch size means all genes are returned in a single group
+                matched_genes = get_genes_for_go_term_set(gene_go_ids, original_genes, taxon_id, domain_id, batch_size=99999)
                 print(f"    → {len(matched_genes)} genes share the exact GO term set")
 
                 if go_term_grouping == "all":
                     for new_gene in matched_genes:
                         all_records.append({
                             "source_gene":       gene,
-                            "source_go_ids":     "|".join(gene_go_ids),
+                            "source_go_id":     "|".join(gene_go_ids),
                             "new_gene":          new_gene,
                             "go_term_hit_count": len(gene_go_ids),
                         })
@@ -247,7 +265,7 @@ def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_group
                         all_records.append({
                             "source_gene":       gene[0],
                             "go_category":       gene[1],
-                            "source_go_ids":     "|".join(gene_go_ids),
+                            "source_go_id":     "|".join(gene_go_ids),
                             "new_gene":          new_gene,
                             "go_term_hit_count": len(gene_go_ids),
                         })
@@ -263,8 +281,8 @@ def expand_genes_from_go_terms(go_df: pd.DataFrame, taxon_id: int, go_term_group
 
     # Deduplicate: one row per (new_gene, source_go_id) pair
     df = df.drop_duplicates(subset=["new_gene",
-                                     "source_go_id" if go_term_grouping == "none"
-                                     else "source_gene"])
+                                    "source_go_id" if go_term_grouping == "none"
+                                    else "source_gene"])
 
     # Summary: how many GO terms link to each new gene (a relevance signal)
     if go_term_grouping == "none":
