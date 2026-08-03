@@ -7,3 +7,5 @@ GEOparse
 pydantic
 langchain_google_genai
 langgraph
+xlrd
+openpyxl

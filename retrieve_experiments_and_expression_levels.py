@@ -64,7 +64,7 @@ def nc_accession_to_assembly_accession(nc_accession: str, ncbi_email: str) -> st
         
         # Sanitize dangerous control characters from raw text before parsing JSON
         clean_text = re.sub(r'[\x00-\x1F\x7F]', '', resp.text)
-        data = json.loads(clean_text) # Ensure you 'import json' at the top of the file
+        data = json.loads(clean_text)
     except Exception as e:
         print(f"[GFF] eutils nuccore-assembly link failed: {e}")
         return None
