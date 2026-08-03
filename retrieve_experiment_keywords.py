@@ -1,5 +1,6 @@
 # Step 3 Functions
 
+import os
 from typing import List
 
 from pydantic import BaseModel, Field
@@ -19,8 +20,9 @@ def retrieve_exp_keys(keyword: str, model_name: str, api_key: str):
         search_terms: List[str] = []
 
     # Initialize Gemini with Structured Output
+    os.environ["GOOGLE_API_KEY"] = api_key.strip()
     llm = ChatGoogleGenerativeAI(model=model_name,
-                                google_api_key=api_key,
+                                google_api_key=api_key.strip(),
                                 temperature=0.1)
     structured_llm = llm.with_structured_output(GeoKeywords)
 
