@@ -236,9 +236,9 @@ with st.form(key="gene_list_form", clear_on_submit=False):
     st.text_input("Species name", key="species_input")
     st.text_area("List of gene symbols (case-sensitive)", placeholder="Ex: BRCA1 TP53 TNF", key="gene_list_input")
     st.markdown("*Paste your list of gene symbols in any format. Spaces, commas, new lines, quotes, and special characters will be handled automatically.*")
-    st.text_input("Email address (required by NCBI's API)", key="ncbi_email_input",
+    st.text_input("Email address (required by NCBI's usage policy)", key="ncbi_email_input",
                   help="""
-                  For programmatic access to data, NCBI requires users to provide an email address.
+                  For programmatic access to data, NCBI's usage policy requires users to provide an email address.
                   """)
 
     col1, col2, col3 = st.columns([1,1,10]) # Push buttons closer together
