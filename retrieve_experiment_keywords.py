@@ -1,6 +1,7 @@
 # Step 3 Functions
 
 from typing import List
+
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END

@@ -1,0 +1,9 @@
+streamlit
+requests
+pandas
+numpy
+goatools
+GEOparse
+pydantic
+langchain_google_genai
+langgraph
