@@ -1,9 +1,9 @@
 # Gene Expression Scout
 
+import os
 from datetime import datetime
 from collections import Counter
 import json
-from pprint import pprint
 
 import streamlit as st
 import requests
