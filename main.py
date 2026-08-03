@@ -143,10 +143,10 @@ def load_godag():
     obo_filename = "go-basic.obo"
     # Download file if it doesn't exist locally on the cloud server
     if not os.path.exists(obo_filename):
-        with st.spinner("Downloading Gene Ontology data (one-time setup)..."):
-            response = requests.get(obo_url)
-            with open(obo_filename, "wb") as f:
-                f.write(response.content)
+        #Download Gene Ontology data (one-time setup)
+        response = requests.get(obo_url)
+        with open(obo_filename, "wb") as f:
+            f.write(response.content)
     
     # Load and return the GO DAG object
     return GODag(obo_filename)
