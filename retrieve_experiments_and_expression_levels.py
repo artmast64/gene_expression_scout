@@ -483,45 +483,33 @@ def find_geo_experiments(species: str, condition: str, ncbi_email: str, retmax: 
         "email":   ncbi_email,
     }
 
-    # Call GEO API
+    # Retry logic for HTTP 429 (too many requests)
     print(f"\nSearching GEO for condition '{condition}' and species '{species}'...")
-    # Retry if HTTP Error 429 (too many requests) appears
-    recent_status_code = 429
-    while recent_status_code == 429:
+    max_retries = 5
+    for attempt in range(max_retries):
         search_resp = requests.get(f"{eutils_url}/esearch.fcgi", params=search_params, timeout=30)
-        recent_status_code = search_resp.status_code
-
-        if recent_status_code == 429:
-            # Look for the Retry-After header
+        
+        if search_resp.status_code == 429:
             retry_after = search_resp.headers.get("Retry-After")
-
+            wait_time = 5  # default fallback wait time
+            
             if retry_after:
                 try:
-                    # Handle integer format (seconds)
                     wait_time = int(retry_after)
                 except ValueError:
-                    # Handle HTTP-date timestamp format
                     try:
-                        target_time = datetime.strptime(
-                            retry_after, "%a, %d %b %Y %H:%M:%S GMT"
-                        )
-                        wait_time = max(
-                            0, (target_time - datetime.utcnow()).total_seconds()
-                        )
+                        target_time = datetime.strptime(retry_after, "%a, %d %b %Y %H:%M:%S GMT")
+                        wait_time = max(1, int((target_time - datetime.utcnow()).total_seconds()))
                     except ValueError:
-                        wait_time = 5  # Fallback if date parsing fails
+                        wait_time = 5
 
-                print(f"Rate limited. Waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-                continue  # Retry the loop
-            else:
-                print("Rate limited, but no Retry-After header. Waiting 5s...")
-                time.sleep(5)
-                continue
+            print(f"Rate limited (429). Waiting {wait_time}s before retry (Attempt {attempt + 1}/{max_retries})...")
+            time.sleep(wait_time)
+        else:
+            # Not a 429, break out of retry loop to handle response below
+            break
 
-        return search_resp  # Success or other status code
-
-    search_resp = requests.get(f"{eutils_url}/esearch.fcgi", params=search_params, timeout=30)
+    # Raise exception if request failed (e.g. 404, 500, or persistent 429 after all retries)
     search_resp.raise_for_status()
     search_data = search_resp.json()
 
@@ -543,9 +531,14 @@ def find_geo_experiments(species: str, condition: str, ncbi_email: str, retmax: 
         "email":   ncbi_email,
     }
 
-    # Call GEO API
     print(f"Retrieving metadata from GEO results...")
-    summary_resp = requests.get(f"{eutils_url}/esummary.fcgi", params=summary_params)
+    for attempt in range(max_retries):
+        summary_resp = requests.get(f"{eutils_url}/esummary.fcgi", params=summary_params)
+        if summary_resp.status_code == 429:
+            time.sleep(3)
+        else:
+            break
+    
     summary_resp.raise_for_status()
     summary_data = summary_resp.json()
     print("Metadata retrieved")
