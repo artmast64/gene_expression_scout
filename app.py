@@ -301,7 +301,7 @@ if st.session_state.processing_active:
                 drop_unmatched_genes = st.session_state.get("drop_unmatched_genes", False)
 
                 # Get hardcoded variables
-                gff_cache_dir, supp_cache_dir, ncbi_email, category_map = main.get_params()
+                gff_cache_dir, supp_cache_dir, category_map = main.get_params()
 
                 # Print settings to console (don't print if pending prompt)
                 if st.session_state.pending_prompt is None:

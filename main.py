@@ -34,10 +34,6 @@ def get_params():
     # Supplementary files cache
     supp_cache_dir = "supp_cache"
 
-    # Register your email with NCBI (required by their usage policy)
-    ncbi_email = "bjohnsonhill@oakland.edu" # <-- TEMPORARY email !!!
-    #ncbi_email = input("\n[!] NCBI's API requires an email address\nPlease input your email: ")
-
     #skip_steps_flag = 1
 
     # Map UniProt GO category codes to human-readable labels
