@@ -43,7 +43,7 @@ def get_params():
         "C": "Cellular Component",
     }
 
-    return gff_cache_dir, supp_cache_dir, ncbi_email, category_map
+    return gff_cache_dir, supp_cache_dir, category_map
 
 
 def print_settings(species, condition, gene_list, model_name, go_term_grouping, batch_size, min_depth, max_series_return, warn_file_size_gb, drop_unmatched_genes):
