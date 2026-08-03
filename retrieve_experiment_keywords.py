@@ -20,7 +20,7 @@ def retrieve_exp_keys(keyword: str, model_name: str, api_key: str):
 
     # Initialize Gemini with Structured Output
     llm = ChatGoogleGenerativeAI(model=model_name,
-                                api_key=api_key,
+                                google_api_key=api_key,
                                 temperature=0.1)
     structured_llm = llm.with_structured_output(GeoKeywords)
 
